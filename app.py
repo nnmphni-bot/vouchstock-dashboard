@@ -1,233 +1,356 @@
-import os
-import json
-import time
-import asyncio
+from flask import Flask, request, redirect, session, jsonify, render_template_string
+import sqlite3, uuid, os, requests
 from datetime import datetime
 
-import aiohttp
-from flask import Flask, render_template, request, jsonify
-
 app = Flask(__name__)
+app.secret_key = "CHANGE_THIS_SECRET_KEY"
 
-USDT_ADDRESS = "0x074b03699b5b354e293459347ba1803f82b1e5ef"
-USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
-LTC_ADDRESS = "LcyginaTtsPeSp4xFaK5R47mbMaFbbZiat"
+ADMIN_PASSWORD = "123456"  # เปลี่ยนรหัสแอดมินตรงนี้
+DISCORD_WEBHOOK = ""       # ใส่ Discord webhook ถ้ามี
 
-USED_FILE = "used_txids.json"
-OLD_TX_BUFFER_SECONDS = 60
+LTC_ADDRESS = "ใส่กระเป๋า LTC"
+USDT_ADDRESS = "ใส่กระเป๋า USDT"
 
+PRODUCTS = [
+    {"id": "boostfps", "name": "Boost FPS Pack", "price": 99, "stock": "ลิงก์โหลด / คีย์สินค้า"},
+    {"id": "discordbot", "name": "Discord Bot Setup", "price": 299, "stock": "ติดต่อแอดมินเพื่อรับงาน"},
+    {"id": "premium", "name": "Premium Package", "price": 499, "stock": "ของพรีเมียมส่งหลังแอดมินยืนยัน"},
+]
 
-def load_used():
-    if os.path.exists(USED_FILE):
+def db():
+    con = sqlite3.connect("shop.db")
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db():
+    con = db()
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        discord TEXT,
+        product_id TEXT,
+        product_name TEXT,
+        price INTEGER,
+        pay_type TEXT,
+        txid TEXT UNIQUE,
+        status TEXT,
+        created_at TEXT
+    )
+    """)
+    con.commit()
+    con.close()
+
+def notify_discord(text):
+    if DISCORD_WEBHOOK:
         try:
-            with open(USED_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+            requests.post(DISCORD_WEBHOOK, json={"content": text}, timeout=5)
         except:
-            return set()
-    return set()
-
-
-def save_used(data):
-    with open(USED_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(data), f, indent=2)
-
-
-USED_TXIDS = load_used()
-
-
-def clean_amount(amount):
-    try:
-        return float(str(amount).replace("$", "").replace("THB", "").strip())
-    except:
-        return None
-
-
-async def bsc_rpc(method, params):
-    url = "https://bsc-dataseed.binance.org/"
-    payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
-
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json=payload) as response:
-            return await response.json(content_type=None)
-
-
-async def get_ltc_price():
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
-
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                return None
-            data = await response.json(content_type=None)
-
-    return float(data["litecoin"]["usd"])
-
-
-async def check_usdt(txid, expected_amount, started_at):
-    txid = txid.strip()
-
-    if not txid.startswith("0x"):
-        txid = "0x" + txid
-
-    if len(txid.replace("0x", "")) != 64:
-        return False, "Invalid BSC TxID format."
-
-    expected = clean_amount(expected_amount)
-
-    if expected is None:
-        return False, "Invalid amount."
-
-    receipt_data = await bsc_rpc("eth_getTransactionReceipt", [txid])
-    result = receipt_data.get("result")
-
-    if result is None:
-        return False, "Transaction not found on BSC."
-
-    if result.get("status") != "0x1":
-        return False, "BSC transaction failed."
-
-    block_hex = result.get("blockNumber")
-    block_data = await bsc_rpc("eth_getBlockByNumber", [block_hex, False])
-    block = block_data.get("result")
-
-    if not block or not block.get("timestamp"):
-        return False, "Cannot read transaction time."
-
-    tx_time = int(block["timestamp"], 16)
-
-    if tx_time < started_at - OLD_TX_BUFFER_SECONDS:
-        return False, "Old transaction. Please send a new payment after opening this page."
-
-    received = 0.0
-
-    for log in result.get("logs", []):
-        if log.get("address", "").lower() != USDT_CONTRACT.lower():
-            continue
-
-        topics = log.get("topics", [])
-
-        if len(topics) < 3:
-            continue
-
-        to_wallet = "0x" + topics[2][-40:]
-
-        if to_wallet.lower() != USDT_ADDRESS.lower():
-            continue
-
-        raw = int(log.get("data", "0x0"), 16)
-        received += raw / (10 ** 18)
-
-    if received <= 0:
-        return False, "USDT not sent to shop wallet."
-
-    if received < expected:
-        return False, f"Received only {received:.2f} USDT. Required {expected:.2f} USDT."
-
-    return True, f"USDT verified. Received {received:.2f} USDT."
-
-
-async def check_ltc(txid, expected_amount, started_at):
-    expected = clean_amount(expected_amount)
-
-    if expected is None:
-        return False, "Invalid amount."
-
-    url = f"https://api.blockcypher.com/v1/ltc/main/txs/{txid.strip()}"
-
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                return False, "Litecoin transaction not found."
-            data = await response.json(content_type=None)
-
-    tx_time_text = data.get("confirmed") or data.get("received")
-
-    if tx_time_text:
-        tx_time = int(datetime.fromisoformat(tx_time_text.replace("Z", "+00:00")).timestamp())
-
-        if tx_time < started_at - OLD_TX_BUFFER_SECONDS:
-            return False, "Old transaction. Please send a new payment after opening this page."
-
-    if data.get("confirmations", 0) < 1:
-        return False, "Waiting for Litecoin confirmation."
-
-    received_ltc = 0.0
-
-    for output in data.get("outputs", []):
-        if LTC_ADDRESS in output.get("addresses", []):
-            received_ltc += output.get("value", 0) / 100000000
-
-    if received_ltc <= 0:
-        return False, "LTC not sent to shop wallet."
-
-    price = await get_ltc_price()
-
-    if price is None:
-        return True, f"LTC received: {received_ltc:.8f}. Cannot check USD price now."
-
-    received_usd = received_ltc * price
-
-    if received_usd < expected:
-        return False, f"Received only ${received_usd:.2f}. Required ${expected:.2f}."
-
-    return True, f"Litecoin verified. Received {received_ltc:.8f} LTC ≈ ${received_usd:.2f}."
-
+            pass
 
 @app.route("/")
 def home():
-    product = request.args.get("product", "Roblox Premium 450")
-    amount = request.args.get("amount", "5")
-    started_at = int(time.time())
+    return render_template_string(HTML, products=PRODUCTS)
 
-    return render_template(
-        "index.html",
-        product=product,
-        amount=amount,
-        usdt=USDT_ADDRESS,
-        ltc=LTC_ADDRESS,
-        started_at=started_at
+@app.route("/checkout", methods=["POST"])
+def checkout():
+    discord = request.form.get("discord", "").strip()
+    product_id = request.form.get("product_id")
+    pay_type = request.form.get("pay_type")
+
+    product = next((p for p in PRODUCTS if p["id"] == product_id), None)
+    if not product or not discord:
+        return redirect("/")
+
+    order_id = str(uuid.uuid4())[:8].upper()
+    address = LTC_ADDRESS if pay_type == "ltc" else USDT_ADDRESS
+
+    con = db()
+    con.execute("""
+    INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        order_id,
+        discord,
+        product["id"],
+        product["name"],
+        product["price"],
+        pay_type,
+        "",
+        "WAIT_TXID",
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    con.commit()
+    con.close()
+
+    notify_discord(
+        f"🛒 มีออเดอร์ใหม่\n"
+        f"Order: `{order_id}`\n"
+        f"Discord: `{discord}`\n"
+        f"สินค้า: **{product['name']}**\n"
+        f"ราคา: `{product['price']} บาท`\n"
+        f"จ่ายด้วย: `{pay_type.upper()}`"
     )
 
+    return render_template_string(PAYMENT, order_id=order_id, product=product, address=address, pay_type=pay_type)
 
-@app.route("/verify", methods=["POST"])
-def verify():
-    data = request.json or {}
-
-    method = data.get("method")
-    txid = data.get("txid", "").strip()
-    amount = data.get("amount")
-    started_at = int(data.get("started_at", time.time()))
+@app.route("/submit_txid", methods=["POST"])
+def submit_txid():
+    order_id = request.form.get("order_id", "").strip()
+    txid = request.form.get("txid", "").strip()
 
     if not txid:
-        return jsonify({"ok": False, "message": "Please enter TxID."})
+        return "กรอก TXID ก่อน"
 
-    normalized = f"{method}:{txid.lower()}"
+    con = db()
 
-    if normalized in USED_TXIDS:
-        return jsonify({"ok": False, "message": "Duplicate TxID. This transaction was already used."})
+    used = con.execute("SELECT * FROM orders WHERE txid=?", (txid,)).fetchone()
+    if used:
+        con.close()
+        return "TXID นี้ถูกใช้ไปแล้ว"
 
-    try:
-        if method == "USDT":
-            ok, msg = asyncio.run(check_usdt(txid, amount, started_at))
-        elif method == "LTC":
-            ok, msg = asyncio.run(check_ltc(txid, amount, started_at))
-        else:
-            ok, msg = False, "Unsupported payment method."
-    except Exception as e:
-        print("VERIFY ERROR:", e)
-        return jsonify({"ok": False, "message": "System error while checking payment."})
+    order = con.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not order:
+        con.close()
+        return "ไม่เจอออเดอร์"
 
-    if ok:
-        USED_TXIDS.add(normalized)
-        save_used(USED_TXIDS)
+    con.execute("UPDATE orders SET txid=?, status=? WHERE id=?", (txid, "WAIT_ADMIN", order_id))
+    con.commit()
+    con.close()
 
-    return jsonify({"ok": ok, "message": msg})
+    notify_discord(
+        f"💸 ลูกค้าส่ง TXID แล้ว\n"
+        f"Order: `{order_id}`\n"
+        f"TXID: `{txid}`\n"
+        f"สถานะ: รอแอดมินตรวจ"
+    )
 
+    return render_template_string(DONE, order_id=order_id)
 
-port = int(os.environ.get("PORT", 5000))
+@app.route("/track/<order_id>")
+def track(order_id):
+    con = db()
+    order = con.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    con.close()
+    if not order:
+        return "ไม่เจอออเดอร์"
+    return render_template_string(TRACK, order=order)
+
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    if request.method == "POST":
+        password = request.form.get("password")
+        if password == ADMIN_PASSWORD:
+            session["admin"] = True
+            return redirect("/admin")
+        return "รหัสผิด"
+
+    if not session.get("admin"):
+        return render_template_string(LOGIN)
+
+    con = db()
+    orders = con.execute("SELECT * FROM orders ORDER BY created_at DESC").fetchall()
+    con.close()
+    return render_template_string(ADMIN, orders=orders)
+
+@app.route("/admin/approve/<order_id>")
+def approve(order_id):
+    if not session.get("admin"):
+        return redirect("/admin")
+
+    con = db()
+    order = con.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    product = next((p for p in PRODUCTS if p["id"] == order["product_id"]), None)
+
+    con.execute("UPDATE orders SET status=? WHERE id=?", ("PAID_DELIVERED", order_id))
+    con.commit()
+    con.close()
+
+    notify_discord(
+        f"✅ อนุมัติออเดอร์แล้ว\n"
+        f"Order: `{order_id}`\n"
+        f"ลูกค้า: `{order['discord']}`\n"
+        f"สินค้า: **{order['product_name']}**"
+    )
+
+    return render_template_string(DELIVER, order=order, product=product)
+
+@app.route("/admin/reject/<order_id>")
+def reject(order_id):
+    if not session.get("admin"):
+        return redirect("/admin")
+
+    con = db()
+    con.execute("UPDATE orders SET status=? WHERE id=?", ("REJECTED", order_id))
+    con.commit()
+    con.close()
+
+    notify_discord(f"❌ ปฏิเสธออเดอร์ `{order_id}`")
+    return redirect("/admin")
+
+HTML = """
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<title>SyncZone Shop</title>
+<style>
+body{margin:0;background:#0b0b12;color:white;font-family:Arial}
+.header{padding:30px;text-align:center;background:#151525}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;padding:30px}
+.card{background:#181827;border-radius:20px;padding:25px;box-shadow:0 0 20px #000}
+button{background:#5865F2;color:white;border:0;padding:12px;border-radius:12px;width:100%;font-size:16px;cursor:pointer}
+input,select{width:100%;padding:12px;border-radius:12px;border:0;margin:8px 0}
+.price{color:#00ff99;font-size:24px}
+a{color:#8ea2ff}
+</style>
+</head>
+<body>
+<div class="header">
+<h1>SyncZone Shop</h1>
+<p>ร้านขายของอัตโนมัติ จ่าย LTC / USDT</p>
+<a href="/admin">Admin</a>
+</div>
+
+<div class="grid">
+{% for p in products %}
+<div class="card">
+<h2>{{p.name}}</h2>
+<div class="price">{{p.price}} บาท</div>
+<form method="POST" action="/checkout">
+<input name="discord" placeholder="Discord ของมึง เช่น user#0001" required>
+<input type="hidden" name="product_id" value="{{p.id}}">
+<select name="pay_type">
+<option value="ltc">Litecoin LTC</option>
+<option value="usdt">USDT</option>
+</select>
+<button>ซื้อเลย</button>
+</form>
+</div>
+{% endfor %}
+</div>
+</body>
+</html>
+"""
+
+PAYMENT = """
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<title>Payment</title>
+<style>
+body{background:#0b0b12;color:white;font-family:Arial;text-align:center;padding:30px}
+.box{max-width:500px;margin:auto;background:#181827;padding:25px;border-radius:20px}
+input{width:100%;padding:12px;border-radius:12px;border:0;margin-top:10px}
+button{background:#00b894;color:white;border:0;padding:12px;border-radius:12px;width:100%;margin-top:10px}
+.code{background:#000;padding:12px;border-radius:10px;word-break:break-all}
+</style>
+</head>
+<body>
+<div class="box">
+<h1>ชำระเงิน</h1>
+<p>Order: <b>{{order_id}}</b></p>
+<p>สินค้า: {{product.name}}</p>
+<p>ราคา: {{product.price}} บาท</p>
+<p>จ่ายด้วย: {{pay_type.upper()}}</p>
+
+<h3>โอนไปที่กระเป๋านี้</h3>
+<div class="code">{{address}}</div>
+
+<img src="https://api.qrserver.com/v1/create-qr-code/?size=250x250&data={{address}}" style="margin-top:15px">
+
+<form method="POST" action="/submit_txid">
+<input type="hidden" name="order_id" value="{{order_id}}">
+<input name="txid" placeholder="วาง TXID ตรงนี้" required>
+<button>ส่ง TXID ให้แอดมินตรวจ</button>
+</form>
+
+<p><a href="/track/{{order_id}}">เช็คสถานะออเดอร์</a></p>
+</div>
+</body>
+</html>
+"""
+
+DONE = """
+<body style="background:#0b0b12;color:white;font-family:Arial;text-align:center;padding:40px">
+<h1>ส่ง TXID แล้ว</h1>
+<p>Order {{order_id}} รอแอดมินตรวจ</p>
+<a style="color:#8ea2ff" href="/track/{{order_id}}">เช็คสถานะ</a>
+</body>
+"""
+
+TRACK = """
+<body style="background:#0b0b12;color:white;font-family:Arial;text-align:center;padding:40px">
+<h1>สถานะออเดอร์</h1>
+<p>Order: <b>{{order.id}}</b></p>
+<p>สินค้า: {{order.product_name}}</p>
+<p>ราคา: {{order.price}} บาท</p>
+<p>สถานะ: <b>{{order.status}}</b></p>
+<p>TXID: {{order.txid}}</p>
+<a style="color:#8ea2ff" href="/">กลับหน้าร้าน</a>
+</body>
+"""
+
+LOGIN = """
+<body style="background:#0b0b12;color:white;font-family:Arial;text-align:center;padding:40px">
+<h1>Admin Login</h1>
+<form method="POST">
+<input name="password" type="password" placeholder="รหัสแอดมิน" style="padding:12px;border-radius:10px">
+<button style="padding:12px;border-radius:10px">เข้า</button>
+</form>
+</body>
+"""
+
+ADMIN = """
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<title>Admin</title>
+<style>
+body{background:#0b0b12;color:white;font-family:Arial;padding:20px}
+table{width:100%;border-collapse:collapse;background:#181827}
+td,th{padding:10px;border-bottom:1px solid #333}
+a{color:white;padding:7px 10px;border-radius:8px;text-decoration:none}
+.ok{background:#00b894}.no{background:#d63031}
+</style>
+</head>
+<body>
+<h1>Admin Dashboard</h1>
+<table>
+<tr>
+<th>Order</th><th>Discord</th><th>สินค้า</th><th>ราคา</th><th>จ่าย</th><th>TXID</th><th>สถานะ</th><th>จัดการ</th>
+</tr>
+{% for o in orders %}
+<tr>
+<td>{{o.id}}</td>
+<td>{{o.discord}}</td>
+<td>{{o.product_name}}</td>
+<td>{{o.price}}</td>
+<td>{{o.pay_type}}</td>
+<td>{{o.txid}}</td>
+<td>{{o.status}}</td>
+<td>
+<a class="ok" href="/admin/approve/{{o.id}}">อนุมัติ</a>
+<a class="no" href="/admin/reject/{{o.id}}">ปฏิเสธ</a>
+</td>
+</tr>
+{% endfor %}
+</table>
+</body>
+</html>
+"""
+
+DELIVER = """
+<body style="background:#0b0b12;color:white;font-family:Arial;text-align:center;padding:40px">
+<h1>อนุมัติแล้ว</h1>
+<p>ส่งข้อมูลนี้ให้ลูกค้า</p>
+<div style="background:#111;padding:20px;border-radius:15px;max-width:600px;margin:auto">
+<p><b>{{product.stock}}</b></p>
+</div>
+<p><a style="color:#8ea2ff" href="/admin">กลับแอดมิน</a></p>
+</body>
+"""
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=port)
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=True)
