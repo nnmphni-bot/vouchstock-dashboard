@@ -1,233 +1,210 @@
-import os
-import json
-import time
-import asyncio
-from datetime import datetime
-
-import aiohttp
-from flask import Flask, render_template, request, jsonify
-
-app = Flask(__name__)
-
-USDT_ADDRESS = "0x074b03699b5b354e293459347ba1803f82b1e5ef"
-USDT_CONTRACT = "0x55d398326f99059fF775485246999027B3197955"
-LTC_ADDRESS = "LcyginaTtsPeSp4xFaK5R47mbMaFbbZiat"
-
-USED_FILE = "used_txids.json"
-OLD_TX_BUFFER_SECONDS = 60
-
-
-def load_used():
-    if os.path.exists(USED_FILE):
-        try:
-            with open(USED_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except:
-            return set()
-    return set()
-
-
-def save_used(data):
-    with open(USED_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(data), f, indent=2)
-
-
-USED_TXIDS = load_used()
-
-
-def clean_amount(amount):
-    try:
-        return float(str(amount).replace("$", "").replace("THB", "").strip())
-    except:
-        return None
-
-
-async def bsc_rpc(method, params):
-    url = "https://bsc-dataseed.binance.org/"
-    payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
-
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json=payload) as response:
-            return await response.json(content_type=None)
-
-
-async def get_ltc_price():
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
-
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                return None
-            data = await response.json(content_type=None)
-
-    return float(data["litecoin"]["usd"])
-
-
-async def check_usdt(txid, expected_amount, started_at):
-    txid = txid.strip()
-
-    if not txid.startswith("0x"):
-        txid = "0x" + txid
-
-    if len(txid.replace("0x", "")) != 64:
-        return False, "Invalid BSC TxID format."
-
-    expected = clean_amount(expected_amount)
-
-    if expected is None:
-        return False, "Invalid amount."
-
-    receipt_data = await bsc_rpc("eth_getTransactionReceipt", [txid])
-    result = receipt_data.get("result")
-
-    if result is None:
-        return False, "Transaction not found on BSC."
-
-    if result.get("status") != "0x1":
-        return False, "BSC transaction failed."
-
-    block_hex = result.get("blockNumber")
-    block_data = await bsc_rpc("eth_getBlockByNumber", [block_hex, False])
-    block = block_data.get("result")
-
-    if not block or not block.get("timestamp"):
-        return False, "Cannot read transaction time."
-
-    tx_time = int(block["timestamp"], 16)
-
-    if tx_time < started_at - OLD_TX_BUFFER_SECONDS:
-        return False, "Old transaction. Please send a new payment after opening this page."
-
-    received = 0.0
-
-    for log in result.get("logs", []):
-        if log.get("address", "").lower() != USDT_CONTRACT.lower():
-            continue
-
-        topics = log.get("topics", [])
-
-        if len(topics) < 3:
-            continue
-
-        to_wallet = "0x" + topics[2][-40:]
-
-        if to_wallet.lower() != USDT_ADDRESS.lower():
-            continue
-
-        raw = int(log.get("data", "0x0"), 16)
-        received += raw / (10 ** 18)
-
-    if received <= 0:
-        return False, "USDT not sent to shop wallet."
-
-    if received < expected:
-        return False, f"Received only {received:.2f} USDT. Required {expected:.2f} USDT."
-
-    return True, f"USDT verified. Received {received:.2f} USDT."
-
-
-async def check_ltc(txid, expected_amount, started_at):
-    expected = clean_amount(expected_amount)
-
-    if expected is None:
-        return False, "Invalid amount."
-
-    url = f"https://api.blockcypher.com/v1/ltc/main/txs/{txid.strip()}"
-
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                return False, "Litecoin transaction not found."
-            data = await response.json(content_type=None)
-
-    tx_time_text = data.get("confirmed") or data.get("received")
-
-    if tx_time_text:
-        tx_time = int(datetime.fromisoformat(tx_time_text.replace("Z", "+00:00")).timestamp())
-
-        if tx_time < started_at - OLD_TX_BUFFER_SECONDS:
-            return False, "Old transaction. Please send a new payment after opening this page."
-
-    if data.get("confirmations", 0) < 1:
-        return False, "Waiting for Litecoin confirmation."
-
-    received_ltc = 0.0
-
-    for output in data.get("outputs", []):
-        if LTC_ADDRESS in output.get("addresses", []):
-            received_ltc += output.get("value", 0) / 100000000
-
-    if received_ltc <= 0:
-        return False, "LTC not sent to shop wallet."
-
-    price = await get_ltc_price()
-
-    if price is None:
-        return True, f"LTC received: {received_ltc:.8f}. Cannot check USD price now."
-
-    received_usd = received_ltc * price
-
-    if received_usd < expected:
-        return False, f"Received only ${received_usd:.2f}. Required ${expected:.2f}."
-
-    return True, f"Litecoin verified. Received {received_ltc:.8f} LTC ≈ ${received_usd:.2f}."
-
-
-@app.route("/")
-def home():
-    product = request.args.get("product", "Roblox Premium 450")
-    amount = request.args.get("amount", "5")
-    started_at = int(time.time())
-
-    return render_template(
-        "index.html",
-        product=product,
-        amount=amount,
-        usdt=USDT_ADDRESS,
-        ltc=LTC_ADDRESS,
-        started_at=started_at
-    )
-
-
-@app.route("/verify", methods=["POST"])
-def verify():
-    data = request.json or {}
-
-    method = data.get("method")
-    txid = data.get("txid", "").strip()
-    amount = data.get("amount")
-    started_at = int(data.get("started_at", time.time()))
-
-    if not txid:
-        return jsonify({"ok": False, "message": "Please enter TxID."})
-
-    normalized = f"{method}:{txid.lower()}"
-
-    if normalized in USED_TXIDS:
-        return jsonify({"ok": False, "message": "Duplicate TxID. This transaction was already used."})
-
-    try:
-        if method == "USDT":
-            ok, msg = asyncio.run(check_usdt(txid, amount, started_at))
-        elif method == "LTC":
-            ok, msg = asyncio.run(check_ltc(txid, amount, started_at))
-        else:
-            ok, msg = False, "Unsupported payment method."
-    except Exception as e:
-        print("VERIFY ERROR:", e)
-        return jsonify({"ok": False, "message": "System error while checking payment."})
-
-    if ok:
-        USED_TXIDS.add(normalized)
-        save_used(USED_TXIDS)
-
-    return jsonify({"ok": ok, "message": msg})
-
-
-port = int(os.environ.get("PORT", 5000))
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=port)
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:#05050d;
+  color:#fff;
+  font-family:Arial, sans-serif;
+}
+.wrap{
+  max-width:1500px;
+  margin:auto;
+  padding:18px;
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:18px;
+}
+.card{
+  min-height:360px;
+  background:linear-gradient(180deg,#10101e,#070710);
+  border:1px solid #22223a;
+  border-radius:14px;
+  padding:22px;
+  box-shadow:0 0 35px rgba(118,35,255,.18);
+  position:relative;
+}
+h1,h2{margin:0 0 14px;color:#fff}
+h1{font-size:30px}
+h2{font-size:22px}
+p{color:#c9c9d8;line-height:1.6}
+.home{overflow:hidden}
+.hero-img{
+  position:absolute;
+  right:20px;
+  top:20px;
+  width:150px;
+  height:110px;
+  border-radius:14px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:70px;
+  background:radial-gradient(circle,#7b2cff,#130526 65%);
+  box-shadow:0 0 40px rgba(142,64,255,.65);
+}
+.menu-grid{
+  margin-top:30px;
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:12px;
+}
+button,.pay,select,input{
+  border:none;
+  border-radius:10px;
+  background:#17172a;
+  color:white;
+  padding:14px;
+}
+button,.pay{cursor:pointer}
+.menu-grid button{
+  text-align:left;
+  border:1px solid #292947;
+  font-weight:bold;
+}
+.menu-grid span,small{
+  color:#9c9cb3;
+  font-size:12px;
+}
+.status{
+  position:absolute;
+  bottom:16px;
+}
+.payment h1{
+  color:#a855f7;
+  font-size:34px;
+}
+.pay{
+  margin-top:11px;
+  border:1px solid #2b2b48;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+.pay.active{
+  background:#20203a;
+  border-color:#8b35ff;
+}
+.pay span{
+  background:#8b35ff;
+  font-size:12px;
+  padding:5px 9px;
+  border-radius:7px;
+}
+.pay.disabled{
+  opacity:.65;
+}
+.bottom{
+  position:absolute;
+  bottom:18px;
+  left:22px;
+  right:22px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+.info{
+  display:grid;
+  grid-template-columns:120px 1fr;
+  gap:10px;
+  margin:20px 0;
+}
+.info span{color:#aaaabd}
+.info b{font-weight:500}
+label{color:#cfcfe8;font-size:14px}
+.address,.code{
+  margin-top:8px;
+  background:#070711;
+  border:1px solid #2c2c4a;
+  border-radius:10px;
+  padding:13px;
+  word-break:break-all;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+.qr{
+  width:95px;
+  height:95px;
+  background:#fff;
+  color:#000;
+  margin:14px 0;
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  font-weight:bold;
+}
+.warn{
+  background:#181225;
+  border:1px solid #5223a8;
+  color:#ffd76b;
+  border-radius:12px;
+  padding:14px;
+  line-height:1.5;
+}
+.primary{
+  background:linear-gradient(90deg,#6728ff,#9d4edd);
+  font-weight:bold;
+  margin-top:14px;
+}
+.danger{
+  background:#d92d36;
+  font-weight:bold;
+  margin-top:14px;
+}
+.success{
+  background:#2fbf71;
+  font-weight:bold;
+  margin-top:14px;
+}
+.back{
+  background:#151526;
+  margin-top:14px;
+}
+select,input{
+  width:100%;
+  margin-top:14px;
+  border:1px solid #262644;
+}
+.full{width:100%}
+.result{
+  margin-top:16px;
+  padding:14px;
+  background:#0b0b15;
+  border:1px solid #2c2c4a;
+  border-radius:10px;
+  color:#d8c4ff;
+}
+.result.good{
+  color:#48e07b;
+  border-color:#48e07b;
+}
+.result.bad{
+  color:#ff5c5c;
+  border-color:#ff5c5c;
+}
+.ticket h2 span,.done h2 span{
+  font-size:12px;
+  background:#3b146b;
+  color:#d8b4fe;
+  padding:5px 10px;
+  border-radius:8px;
+}
+.slip{
+  border:1px solid #2c2c4a;
+  background:#090912;
+  border-radius:12px;
+  padding:14px;
+  display:flex;
+  gap:14px;
+}
+.slip-img{
+  width:80px;
+  height:55px;
+  background:#ddd;
+  border-radius:5px;
+}
+.slip span,.green{
+  color:#48e07b;
+}
+@media(max-width:1000px){
+  .wrap{grid-template-columns:1fr}
+}
