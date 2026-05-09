@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VouchStock Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="wrap">
+
+    <section class="card home">
+      <div>
+        <h1>💜 VOUCHSTOCK</h1>
+        <p>ทำรายการได้อย่างง่ายดาย<br>รวดเร็ว ปลอดภัย 100%</p>
+      </div>
+
+      <div class="hero-img">💜</div>
+
+      <div class="menu-grid">
+        <button>🛒 ซื้อสินค้า<br><span>เลือกซื้อสินค้าจากร้าน</span></button>
+        <button>💳 เติมเงิน<br><span>เติมเงินเข้าสู่ระบบ</span></button>
+        <button>📦 เช็คสต็อก<br><span>เช็คสต็อกสินค้า</span></button>
+        <button>📋 ประวัติออเดอร์<br><span>ดูประวัติการสั่งซื้อ</span></button>
+        <button>🎫 เปิด Ticket<br><span>ติดต่อแอดมิน</span></button>
+        <button>🛡️ กฎการใช้งาน<br><span>อ่านกฎและเงื่อนไข</span></button>
+      </div>
+
+      <small class="status">🟢 VouchStock Bot • ระบบอัตโนมัติ</small>
+    </section>
+
+    <section class="card payment">
+      <h2>🛒 เลือกช่องทางการชำระเงิน</h2>
+      <p>ยอดที่ต้องชำระ</p>
+      <h1>{{ amount }} THB</h1>
+
+      <div class="pay active">💚 USDT (BEP-20) <span>แนะนำ</span></div>
+      <div class="pay">💰 Litecoin (LTC)</div>
+      <div class="pay">🧡 Binance Pay</div>
+      <div class="pay">🦋 TrueMoney</div>
+      <div class="pay">🏦 ธนาคารไทย</div>
+
+      <div class="bottom">
+        <button class="back">← ย้อนกลับ</button>
+        <small>🛡️ ระบบปลอดภัย 100%</small>
+      </div>
+    </section>
+
+    <section class="card detail">
+      <h2>💳 รายละเอียดการชำระเงิน</h2>
+
+      <div class="info">
+        <span>สินค้า</span><b>{{ product }}</b>
+        <span>ราคา</span><b>{{ amount }} THB</b>
+        <span>ช่องทาง</span><b>USDT (BEP-20)</b>
+        <span>เครือข่าย</span><b>BSC (Binance Smart Chain)</b>
+      </div>
+
+      <label>ที่อยู่ Address</label>
+      <div class="address">{{ usdt }} <button onclick="copyText('{{ usdt }}')">📋</button></div>
+
+      <div class="qr">QR</div>
+
+      <div class="warn">
+        ⚠️ สำคัญ<br>
+        กรุณาโอนเฉพาะ USDT BEP-20 เท่านั้น<br>
+        ห้ามใช้ TxID เก่า / ห้ามโอนผิดเครือข่าย
+      </div>
+
+      <button class="primary">📤 ส่งหลักฐานการโอน</button>
+      <button class="danger">⊘ ยกเลิกออเดอร์</button>
+    </section>
+
+    <section class="card proof">
+      <h2>📤 ส่งหลักฐานการโอน</h2>
+      <p>กรุณาส่ง TxID หรือหลักฐานการโอนเงิน</p>
+
+      <div class="upload">☁️<br>คลิกเพื่ออัปโหลดไฟล์<br><span>หรือวางไฟล์ตรงนี้</span></div>
+      <input placeholder="ระบุข้อความเพิ่มเติม (ถ้ามี)" />
+      <button class="primary full">ส่งหลักฐาน</button>
+      <button class="back">← ย้อนกลับ</button>
+    </section>
+
+    <section class="card ticket">
+      <h2>🎫 Ticket #1024 <span>รอตรวจสอบ</span></h2>
+
+      <div class="info">
+        <span>ลูกค้า</span><b>@user</b>
+        <span>สินค้า</span><b>{{ product }}</b>
+        <span>จำนวนเงิน</span><b>{{ amount }} THB</b>
+        <span>ช่องทาง</span><b>USDT (BEP-20)</b>
+        <span>TxID</span><b>ดูใน explorer</b>
+      </div>
+
+      <div class="slip">
+        <div class="slip-img"></div>
+        <div>
+          <b>{{ amount }} #USDT</b><br>
+          <span>● Completed</span>
+          <p>Date: May 24, 2024<br>Network: BSC<br>To: 0x74Ab...1e5ef</p>
+        </div>
+      </div>
+
+      <button class="success">อนุมัติออเดอร์</button>
+      <button class="danger">ปฏิเสธออเดอร์</button>
+      <button class="back">สอบถามลูกค้า</button>
+    </section>
+
+    <section class="card done">
+      <h2>✅ ออเดอร์ #1024 <span>เสร็จสมบูรณ์</span></h2>
+      <p>แอดมินได้ทำการอนุมัติออเดอร์ของคุณแล้ว</p>
+
+      <div class="info">
+        <span>สินค้า</span><b>{{ product }}</b>
+        <span>จำนวนเงิน</span><b>{{ amount }} THB</b>
+        <span>ช่องทาง</span><b>USDT (BEP-20)</b>
+        <span>สถานะ</span><b class="green">เสร็จสมบูรณ์</b>
+      </div>
+
+      <div class="code">CODE : ABCD-EFGH-IJKL-MNOP <button>📋</button></div>
+      <button class="primary">⭐ ให้คะแนนร้านค้า</button>
+      <button class="primary">🛒 สั่งซื้ออีกครั้ง</button>
+    </section>
+
+  </main>
+
+<script>
+function copyText(text){
+  navigator.clipboard.writeText(text);
+  alert("Copied");
+}
+</script>
+</body>
+</html>
